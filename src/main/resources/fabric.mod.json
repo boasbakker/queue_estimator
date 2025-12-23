@@ -3,7 +3,7 @@
     "id": "queue_estimator",
     "version": "${version}",
     "name": "Queue Estimator",
-    "description": "Estimates queue wait time using exponential decay curve fitting",
+    "description": "Estimates queue wait time using multiple curve fitting formulas (linear, quadratic, exponential, power law, logarithmic)",
     "authors": [
         "QueueEstimator"
     ],
@@ -14,6 +14,9 @@
     "entrypoints": {
         "client": [
             "com.queueestimator.QueueEstimatorMod"
+        ],
+        "modmenu": [
+            "com.queueestimator.config.ModMenuIntegration"
         ]
     },
     "mixins": [
@@ -24,5 +27,8 @@
         "minecraft": "~1.21.4",
         "java": ">=21",
         "fabric-api": "*"
+    },
+    "suggests": {
+        "modmenu": "*"
     }
 }

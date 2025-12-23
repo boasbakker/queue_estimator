@@ -1,23 +1,44 @@
 package com.queueestimator.mixin;
 
 import com.queueestimator.QueueDataTracker;
-import net.minecraft.client.network.ClientPlayNetworkHandler;
-import net.minecraft.network.packet.s2c.play.TitleS2CPacket;
+import com.queueestimator.QueueEstimatorMod;
+import net.minecraft.client.gui.hud.InGameHud;
 import net.minecraft.text.Text;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
-@Mixin(ClientPlayNetworkHandler.class)
+/**
+ * Mixin that hooks into InGameHud.setTitle() to detect when titles are
+ * displayed.
+ * This is more robust than intercepting network packets as it catches all title
+ * displays
+ * regardless of how they are triggered (packets, commands, mods, etc.)
+ */
+@Mixin(InGameHud.class)
 public class TitlePacketMixin {
 
-    @Inject(method = "onTitle", at = @At("HEAD"))
-    private void onTitleReceived(TitleS2CPacket packet, CallbackInfo ci) {
-        // TitleS2CPacket is a record in 1.21.4, use text() accessor
-        Text titleText = packet.text();
-        if (titleText != null) {
-            QueueDataTracker.getInstance().processTitleText(titleText);
+    /**
+     * Called whenever a title is set to be displayed on screen.
+     * This triggers for all title displays, not just network packets.
+     */
+    @Inject(method = "setTitle", at = @At("HEAD"))
+    private void onTitleSet(Text title, CallbackInfo ci) {
+        if (title != null) {
+            QueueEstimatorMod.LOGGER.debug("Title detected: {}", title.getString());
+            QueueDataTracker.getInstance().processTitleText(title);
+        }
+    }
+
+    /**
+     * Also hook into setSubtitle in case queue position is shown as a subtitle.
+     */
+    @Inject(method = "setSubtitle", at = @At("HEAD"))
+    private void onSubtitleSet(Text subtitle, CallbackInfo ci) {
+        if (subtitle != null) {
+            QueueEstimatorMod.LOGGER.debug("Subtitle detected: {}", subtitle.getString());
+            QueueDataTracker.getInstance().processTitleText(subtitle);
         }
     }
 }

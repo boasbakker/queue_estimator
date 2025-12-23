@@ -1,5 +1,6 @@
 package com.queueestimator;
 
+import com.queueestimator.config.QueueEstimatorConfig;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.text.Text;
 
@@ -156,10 +157,11 @@ public class QueueDataTracker {
             position, relativeTime, dataPoints.size());
         
         // Try to estimate and display if we have enough data
-        if (dataPoints.size() >= 5) {
+        QueueEstimatorConfig config = QueueEstimatorConfig.getInstance();
+        if (dataPoints.size() >= config.getMinDataPoints()) {
             estimateAndDisplay();
         } else {
-            int needed = 5 - dataPoints.size();
+            int needed = config.getMinDataPoints() - dataPoints.size();
             sendChatMessage(String.format("§7[Queue] Position: §f%d §7| Collecting data... §8(%d more needed)", 
                 position, needed));
         }
@@ -216,94 +218,61 @@ public class QueueDataTracker {
      */
     private void estimateAndDisplay() {
         try {
-            QueueCurveFitter fitter = new QueueCurveFitter(dataPoints);
-            QueueCurveFitter.FitResult result = fitter.fit();
+            QueueEstimatorConfig config = QueueEstimatorConfig.getInstance();
             
-            if (result != null) {
-                double A = result.A;
-                double B = result.B;
-                double C = result.C;
-                double relRMSE = result.relativeRMSE;
-                
-                // Calculate time when P(t) = 0
-                // P(t) = A * e^(-B*t) - C = 0
-                // A * e^(-B*t) = C
-                // e^(-B*t) = C/A
-                // -B*t = ln(C/A)
-                // t = -ln(C/A) / B = ln(A/C) / B
-                
-                int currentPosition = dataPoints.get(dataPoints.size() - 1).position;
-                
-                if (A > 0 && C > 0 && B > 0 && A > C) {
-                    double tZeroMs = Math.log(A / C) / B;
-                    long estimatedEndTimeMs = sessionStartTime + (long) tZeroMs;
-                    
-                    // Convert to local time
-                    LocalDateTime estimatedTime = LocalDateTime.ofInstant(
-                        Instant.ofEpochMilli(estimatedEndTimeMs),
-                        ZoneId.systemDefault()
-                    );
-                    
-                    String timeStr = estimatedTime.format(TIME_FORMATTER);
-                    
-                    // Calculate minutes remaining
-                    long remainingMs = estimatedEndTimeMs - System.currentTimeMillis();
-                    long remainingMinutes = remainingMs / 60000;
-                    
-                    String message;
-                    if (remainingMs > 0) {
-                        // Good estimate - show ETA
-                        message = String.format(
-                            "§a[Queue] Position: §f%d §a| ETA: §f%s §7(~%d min) §a| Fit: §f%.1f%%",
-                            currentPosition, timeStr, remainingMinutes, relRMSE
-                        );
-                    } else {
-                        // Estimate is in the past - bad model
-                        message = String.format(
-                            "§e[Queue] Position: §f%d §e| ETA: §cInvalid §7(past) §e| Fit: §f%.1f%%",
-                            currentPosition, relRMSE
-                        );
-                    }
-                    
-                    sendChatMessage(message);
-                    QueueEstimatorMod.LOGGER.info("Estimate: ETA={}, A={}, B={}, C={}, relRMSE={}%", 
-                        timeStr, A, B, C, String.format("%.2f", relRMSE));
-                } else {
-                    // Parameters don't allow solving for P(t)=0 (e.g., C=0 means queue never ends)
-                    // Fall back to linear estimate: time = position / rate
-                    long elapsedMs = dataPoints.get(dataPoints.size() - 1).timestamp;
-                    int firstPos = dataPoints.get(0).position;
-                    int posChange = firstPos - currentPosition;
-                    
-                    if (posChange > 0 && elapsedMs > 0) {
-                        double rate = (double) posChange / elapsedMs; // positions per ms
-                        long remainingMs = (long) (currentPosition / rate);
-                        long remainingMinutes = remainingMs / 60000;
-                        
-                        LocalDateTime estimatedTime = LocalDateTime.ofInstant(
-                            Instant.ofEpochMilli(System.currentTimeMillis() + remainingMs),
-                            ZoneId.systemDefault()
-                        );
-                        String timeStr = estimatedTime.format(TIME_FORMATTER);
-                        
-                        sendChatMessage(String.format(
-                            "§e[Queue] Position: §f%d §e| ETA: §f%s §7(~%d min, linear) §e| Fit: §f%.1f%%",
-                            currentPosition, timeStr, remainingMinutes, relRMSE
-                        ));
-                    } else {
-                        sendChatMessage(String.format(
-                            "§e[Queue] Position: §f%d §e| ETA: §7Calculating... §e| Fit: §f%.1f%%",
-                            currentPosition, relRMSE
-                        ));
-                    }
-                }
-            } else {
+            if (!config.hasAnyFormulaEnabled()) {
                 int currentPosition = dataPoints.get(dataPoints.size() - 1).position;
                 sendChatMessage(String.format(
-                    "§e[Queue] Position: §f%d §e| ETA: §7Fitting failed...",
-                    currentPosition
-                ));
+                        "§e[Queue] Position: §f%d §e| No formulas enabled in config!",
+                        currentPosition));
+                return;
             }
+
+            MultiFormulaCurveFitter fitter = new MultiFormulaCurveFitter(dataPoints);
+            MultiFormulaCurveFitter.MultiResult multiResult = fitter.fitAll();
+
+            int currentPosition = dataPoints.get(dataPoints.size() - 1).position;
+            List<MultiFormulaCurveFitter.FitResult> validResults = multiResult.getValidResults();
+
+            if (validResults.isEmpty()) {
+                sendChatMessage(String.format(
+                        "§e[Queue] Position: §f%d §e| All curve fits failed",
+                        currentPosition));
+                return;
+            }
+
+            if (config.isShowAllResults()) {
+                // Show all valid results
+                sendChatMessage(String.format("§a[Queue] Position: §f%d §a| §7%d fit(s) succeeded:",
+                        currentPosition, validResults.size()));
+
+                for (MultiFormulaCurveFitter.FitResult result : validResults) {
+                    String timeStr = formatEta(result.etaMs);
+                    long remainingMinutes = result.etaMs / 60000;
+                    
+                    sendChatMessage(String.format("  §7%s: §fETA %s §7(~%d min) §8| %%RMSE: §f%.1f%%",
+                            result.type.displayName,
+                            timeStr,
+                            remainingMinutes,
+                            result.relativeRMSE));
+                }
+            } else {
+                // Show only the best result
+                MultiFormulaCurveFitter.FitResult best = multiResult.best;
+                if (best != null) {
+                    String timeStr = formatEta(best.etaMs);
+                    long remainingMinutes = best.etaMs / 60000;
+
+                    sendChatMessage(String.format(
+                            "§a[Queue] Position: §f%d §a| ETA: §f%s §7(~%d min) §a| %s §8| %%RMSE: §f%.1f%%",
+                            currentPosition,
+                            timeStr,
+                            remainingMinutes,
+                            best.type.displayName,
+                            best.relativeRMSE));
+                }
+            }
+
         } catch (Exception e) {
             QueueEstimatorMod.LOGGER.error("Error during curve fitting", e);
             int currentPosition = dataPoints.get(dataPoints.size() - 1).position;
@@ -314,6 +283,19 @@ public class QueueDataTracker {
         }
     }
     
+    /**
+     * Format ETA from milliseconds to time string
+     */
+    private String formatEta(long etaMs) {
+        if (etaMs <= 0) {
+            return "Unknown";
+        }
+        LocalDateTime estimatedTime = LocalDateTime.ofInstant(
+                Instant.ofEpochMilli(System.currentTimeMillis() + etaMs),
+                ZoneId.systemDefault());
+        return estimatedTime.format(TIME_FORMATTER);
+    }
+
     /**
      * Send a message to the player's chat
      */
