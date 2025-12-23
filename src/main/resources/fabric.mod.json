@@ -1,0 +1,28 @@
+{
+    "schemaVersion": 1,
+    "id": "queue_estimator",
+    "version": "${version}",
+    "name": "Queue Estimator",
+    "description": "Estimates queue wait time using exponential decay curve fitting",
+    "authors": [
+        "QueueEstimator"
+    ],
+    "contact": {},
+    "license": "MIT",
+    "icon": "assets/queue_estimator/icon.png",
+    "environment": "client",
+    "entrypoints": {
+        "client": [
+            "com.queueestimator.QueueEstimatorMod"
+        ]
+    },
+    "mixins": [
+        "queue_estimator.mixins.json"
+    ],
+    "depends": {
+        "fabricloader": ">=0.16.0",
+        "minecraft": "~1.21.4",
+        "java": ">=21",
+        "fabric-api": "*"
+    }
+}
