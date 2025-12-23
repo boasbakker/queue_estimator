@@ -25,10 +25,18 @@ public class QueueEstimatorConfig {
     private boolean exponentialEnabled = true; // Current shifted exponential: A * e^(-Bt) - C
     private boolean powerLawEnabled = true; // Power law: A * t^(-B) + C
     private boolean logarithmicEnabled = true; // Logarithmic: A - B * ln(t + 1)
+    private boolean tangentEnabled = true; // Tangent: A * tan(B - k*t) - D
+    private boolean hyperbolicEnabled = true; // Hyperbolic: A/(t+B) - C
 
     // Display settings
     private boolean showAllResults = true; // Show all successful fits or just the best one
     private int minDataPoints = 5; // Minimum data points before attempting fit
+
+    // Linear fit windowing - only use last X minutes of data for linear fit
+    private int linearWindowMinutes = 60; // Default: 60 minutes
+
+    // Rate tracking interval - print average rate every X minutes
+    private int rateTrackingIntervalMinutes = 5; // Default: 5 minutes
 
     private QueueEstimatorConfig() {
     }
@@ -111,6 +119,22 @@ public class QueueEstimatorConfig {
         this.logarithmicEnabled = enabled;
     }
 
+    public boolean isTangentEnabled() {
+        return tangentEnabled;
+    }
+
+    public void setTangentEnabled(boolean enabled) {
+        this.tangentEnabled = enabled;
+    }
+
+    public boolean isHyperbolicEnabled() {
+        return hyperbolicEnabled;
+    }
+
+    public void setHyperbolicEnabled(boolean enabled) {
+        this.hyperbolicEnabled = enabled;
+    }
+
     public boolean isShowAllResults() {
         return showAllResults;
     }
@@ -127,11 +151,27 @@ public class QueueEstimatorConfig {
         this.minDataPoints = Math.max(3, Math.min(20, minPoints));
     }
 
+    public int getLinearWindowMinutes() {
+        return linearWindowMinutes;
+    }
+
+    public void setLinearWindowMinutes(int minutes) {
+        this.linearWindowMinutes = Math.max(5, Math.min(240, minutes)); // 5 min to 4 hours
+    }
+
+    public int getRateTrackingIntervalMinutes() {
+        return rateTrackingIntervalMinutes;
+    }
+
+    public void setRateTrackingIntervalMinutes(int minutes) {
+        this.rateTrackingIntervalMinutes = Math.max(1, Math.min(30, minutes)); // 1 to 30 minutes
+    }
+
     /**
      * Check if at least one formula is enabled
      */
     public boolean hasAnyFormulaEnabled() {
         return linearEnabled || quadraticEnabled || exponentialEnabled ||
-                powerLawEnabled || logarithmicEnabled;
+                powerLawEnabled || logarithmicEnabled || tangentEnabled || hyperbolicEnabled;
     }
 }

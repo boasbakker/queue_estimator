@@ -21,6 +21,8 @@ public class QueueEstimatorConfigScreen extends Screen {
     private ButtonWidget exponentialButton;
     private ButtonWidget powerLawButton;
     private ButtonWidget logarithmicButton;
+    private ButtonWidget tangentButton;
+    private ButtonWidget hyperbolicButton;
     private ButtonWidget showAllButton;
 
     public QueueEstimatorConfigScreen(Screen parent) {
@@ -84,23 +86,59 @@ public class QueueEstimatorConfigScreen extends Screen {
                 }).dimensions(centerX - buttonWidth / 2, startY + spacing * 4, buttonWidth, buttonHeight).build();
         this.addDrawableChild(logarithmicButton);
 
+        // Tangent toggle
+        tangentButton = ButtonWidget.builder(
+                getToggleText("Tangent (A·tan(B-kt) - D)", config.isTangentEnabled()),
+                button -> {
+                    config.setTangentEnabled(!config.isTangentEnabled());
+                    button.setMessage(getToggleText("Tangent (A·tan(B-kt) - D)", config.isTangentEnabled()));
+                }).dimensions(centerX - buttonWidth / 2, startY + spacing * 5, buttonWidth, buttonHeight).build();
+        this.addDrawableChild(tangentButton);
+
+        // Hyperbolic toggle
+        hyperbolicButton = ButtonWidget.builder(
+                getToggleText("Hyperbolic (A/(t+B) - C)", config.isHyperbolicEnabled()),
+                button -> {
+                    config.setHyperbolicEnabled(!config.isHyperbolicEnabled());
+                    button.setMessage(getToggleText("Hyperbolic (A/(t+B) - C)", config.isHyperbolicEnabled()));
+                }).dimensions(centerX - buttonWidth / 2, startY + spacing * 6, buttonWidth, buttonHeight).build();
+        this.addDrawableChild(hyperbolicButton);
+
         // Show all results toggle
         showAllButton = ButtonWidget.builder(
                 getToggleText("Show All Results", config.isShowAllResults()),
                 button -> {
                     config.setShowAllResults(!config.isShowAllResults());
                     button.setMessage(getToggleText("Show All Results", config.isShowAllResults()));
-                }).dimensions(centerX - buttonWidth / 2, startY + spacing * 6, buttonWidth, buttonHeight).build();
+                }).dimensions(centerX - buttonWidth / 2, startY + spacing * 8, buttonWidth, buttonHeight).build();
         this.addDrawableChild(showAllButton);
 
         // Min data points slider
         MinDataPointsSlider slider = new MinDataPointsSlider(
                 centerX - buttonWidth / 2,
-                startY + spacing * 7,
+                startY + spacing * 9,
                 buttonWidth,
                 buttonHeight,
                 config.getMinDataPoints());
         this.addDrawableChild(slider);
+
+        // Linear window minutes slider
+        LinearWindowSlider linearWindowSlider = new LinearWindowSlider(
+                centerX - buttonWidth / 2,
+                startY + spacing * 10,
+                buttonWidth,
+                buttonHeight,
+                config.getLinearWindowMinutes());
+        this.addDrawableChild(linearWindowSlider);
+
+        // Rate tracking interval slider
+        RateTrackingSlider rateTrackingSlider = new RateTrackingSlider(
+                centerX - buttonWidth / 2,
+                startY + spacing * 11,
+                buttonWidth,
+                buttonHeight,
+                config.getRateTrackingIntervalMinutes());
+        this.addDrawableChild(rateTrackingSlider);
 
         // Done button
         this.addDrawableChild(ButtonWidget.builder(
@@ -137,7 +175,7 @@ public class QueueEstimatorConfigScreen extends Screen {
                 this.textRenderer,
                 Text.literal("§7Display Settings"),
                 this.width / 2,
-                50 + 25 * 5 + 10,
+                50 + 25 * 7 + 10,
                 0xAAAAAA);
     }
 
@@ -173,6 +211,60 @@ public class QueueEstimatorConfigScreen extends Screen {
 
         private int getValue() {
             return (int) Math.round(this.value * 17) + 3; // Convert back to 3-20 range
+        }
+    }
+
+    /**
+     * Custom slider for linear window minutes setting
+     */
+    private class LinearWindowSlider extends SliderWidget {
+
+        public LinearWindowSlider(int x, int y, int width, int height, int initialValue) {
+            super(x, y, width, height,
+                    Text.literal("Linear Window: " + initialValue + " min"),
+                    (initialValue - 5) / 235.0); // Normalize to 0-1 range (5 to 240)
+        }
+
+        @Override
+        protected void updateMessage() {
+            int value = getValue();
+            this.setMessage(Text.literal("Linear Window: " + value + " min"));
+        }
+
+        @Override
+        protected void applyValue() {
+            config.setLinearWindowMinutes(getValue());
+        }
+
+        private int getValue() {
+            return (int) Math.round(this.value * 235) + 5; // Convert back to 5-240 range
+        }
+    }
+
+    /**
+     * Custom slider for rate tracking interval setting
+     */
+    private class RateTrackingSlider extends SliderWidget {
+
+        public RateTrackingSlider(int x, int y, int width, int height, int initialValue) {
+            super(x, y, width, height,
+                    Text.literal("Rate Log Interval: " + initialValue + " min"),
+                    (initialValue - 1) / 29.0); // Normalize to 0-1 range (1 to 30)
+        }
+
+        @Override
+        protected void updateMessage() {
+            int value = getValue();
+            this.setMessage(Text.literal("Rate Log Interval: " + value + " min"));
+        }
+
+        @Override
+        protected void applyValue() {
+            config.setRateTrackingIntervalMinutes(getValue());
+        }
+
+        private int getValue() {
+            return (int) Math.round(this.value * 29) + 1; // Convert back to 1-30 range
         }
     }
 }

@@ -47,6 +47,10 @@ public class QueueDataTracker {
     private Path csvLogPath = null;
     private static final DateTimeFormatter CSV_FILENAME_FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss");
     
+    // Rate tracking
+    private long lastRateLogTime = -1;
+    private double lastAverageRate = -1; // positions per minute
+
     // Minimum interval between recordings (in ms) to avoid spam but maintain frequency
     // Set to 5 seconds - most queue servers update every 5-60 seconds
     private static final long MIN_RECORD_INTERVAL_MS = 5000;
@@ -140,6 +144,7 @@ public class QueueDataTracker {
             sessionStartTime = currentTime;
             dataPoints.clear();
             initializeCsvLog();
+            lastRateLogTime = currentTime;
         }
         
         long relativeTime = currentTime - sessionStartTime;
@@ -156,6 +161,9 @@ public class QueueDataTracker {
         QueueEstimatorMod.LOGGER.info("Queue position recorded: {} at t={}ms (total points: {})", 
             position, relativeTime, dataPoints.size());
         
+        // Check if it's time to log average rate
+        checkRateTracking(currentTime, relativeTime);
+
         // Try to estimate and display if we have enough data
         QueueEstimatorConfig config = QueueEstimatorConfig.getInstance();
         if (dataPoints.size() >= config.getMinDataPoints()) {
@@ -167,6 +175,79 @@ public class QueueDataTracker {
         }
     }
     
+    /**
+     * Check and log average rate at configured intervals.
+     * Warns if rate is not decreasing (queue not draining faster over time).
+     */
+    private void checkRateTracking(long currentTime, long relativeTime) {
+        QueueEstimatorConfig config = QueueEstimatorConfig.getInstance();
+        long rateIntervalMs = config.getRateTrackingIntervalMinutes() * 60 * 1000L;
+
+        if (lastRateLogTime < 0 || (currentTime - lastRateLogTime) < rateIntervalMs) {
+            return;
+        }
+
+        if (dataPoints.size() < 2) {
+            return;
+        }
+
+        // Calculate average rate over the last interval (or all data if less time has
+        // passed)
+        long windowStart = relativeTime - rateIntervalMs;
+        if (windowStart < 0)
+            windowStart = 0;
+
+        // Find first point in the window
+        int startIdx = 0;
+        for (int i = 0; i < dataPoints.size(); i++) {
+            if (dataPoints.get(i).timestamp >= windowStart) {
+                startIdx = i;
+                break;
+            }
+        }
+
+        // Need at least 2 points in window to calculate rate
+        if (dataPoints.size() - startIdx < 2) {
+            return;
+        }
+
+        DataPoint firstPoint = dataPoints.get(startIdx);
+        DataPoint lastPoint = dataPoints.get(dataPoints.size() - 1);
+
+        double timeDeltaMinutes = (lastPoint.timestamp - firstPoint.timestamp) / 60000.0;
+        if (timeDeltaMinutes < 0.5) {
+            return; // Not enough time elapsed
+        }
+
+        int positionDelta = firstPoint.position - lastPoint.position; // Positive means queue decreased
+        double currentRate = positionDelta / timeDeltaMinutes; // positions per minute
+
+        // Log the rate
+        QueueEstimatorMod.LOGGER.info("Average rate over last {} min: {:.2f} positions/min (from {} to {})",
+                config.getRateTrackingIntervalMinutes(), currentRate, firstPoint.position, lastPoint.position);
+
+        // Send rate info to chat
+        String rateStr = String.format("%.1f", currentRate);
+        sendChatMessage(String.format("§7[Queue] Rate: §f%s §7pos/min over last %d min",
+                rateStr, config.getRateTrackingIntervalMinutes()));
+
+        // Compare with previous rate and warn if not improving
+        if (lastAverageRate >= 0) {
+            if (currentRate <= lastAverageRate) {
+                QueueEstimatorMod.LOGGER.warn("Queue rate is not improving: {:.2f} pos/min (was {:.2f})",
+                        currentRate, lastAverageRate);
+                sendChatMessage(String.format("§e[Queue] Warning: Rate not improving (was %.1f, now %.1f pos/min)",
+                        lastAverageRate, currentRate));
+            } else {
+                QueueEstimatorMod.LOGGER.info("Queue rate improved: {:.2f} pos/min (was {:.2f})",
+                        currentRate, lastAverageRate);
+            }
+        }
+
+        lastAverageRate = currentRate;
+        lastRateLogTime = currentTime;
+    }
+
     /**
      * Initialize CSV log file for this session
      */
@@ -250,11 +331,11 @@ public class QueueDataTracker {
                     String timeStr = formatEta(result.etaMs);
                     long remainingMinutes = result.etaMs / 60000;
                     
-                    sendChatMessage(String.format("  §7%s: §fETA %s §7(~%d min) §8| %%RMSE: §f%.1f%%",
+                    sendChatMessage(String.format("  §7%s: §fETA %s §7(~%d min) §8| R²: §f%.4f",
                             result.type.displayName,
                             timeStr,
                             remainingMinutes,
-                            result.relativeRMSE));
+                            result.rSquared));
                 }
             } else {
                 // Show only the best result
@@ -264,12 +345,12 @@ public class QueueDataTracker {
                     long remainingMinutes = best.etaMs / 60000;
 
                     sendChatMessage(String.format(
-                            "§a[Queue] Position: §f%d §a| ETA: §f%s §7(~%d min) §a| %s §8| %%RMSE: §f%.1f%%",
+                            "§a[Queue] Position: §f%d §a| ETA: §f%s §7(~%d min) §a| %s §8| R²: §f%.4f",
                             currentPosition,
                             timeStr,
                             remainingMinutes,
                             best.type.displayName,
-                            best.relativeRMSE));
+                            best.rSquared));
                 }
             }
 
@@ -315,6 +396,8 @@ public class QueueDataTracker {
         sessionStartTime = -1;
         lastRecordTime = -1;
         csvLogPath = null;
+        lastRateLogTime = -1;
+        lastAverageRate = -1;
         QueueEstimatorMod.LOGGER.info("Queue tracker reset");
     }
     

@@ -25,6 +25,9 @@ public class MultiFormulaCurveFitter {
     // Time scale factor - convert ms to minutes for numerical stability
     private static final double TIME_SCALE = 60000.0;
 
+    // Maximum ETA: 1 week in milliseconds (anything above is considered invalid)
+    private static final long MAX_ETA_MS = 7L * 24 * 60 * 60 * 1000;
+
     /**
      * Enum for formula types
      */
@@ -33,7 +36,9 @@ public class MultiFormulaCurveFitter {
         QUADRATIC("Quadratic", "P(t) = A - B·t - C·t²"),
         EXPONENTIAL("Exponential", "P(t) = A·e^(-B·t) - C"),
         POWER_LAW("Power Law", "P(t) = A·(t+1)^(-B) + C"),
-        LOGARITHMIC("Logarithmic", "P(t) = A - B·ln(t+1)");
+        LOGARITHMIC("Logarithmic", "P(t) = A - B·ln(t+1)"),
+        TANGENT("Tangent", "P(t) = A·tan(B - k·t) - D"),
+        HYPERBOLIC("Hyperbolic", "P(t) = A/(t+B) - C");
 
         public final String displayName;
         public final String formula;
@@ -50,14 +55,14 @@ public class MultiFormulaCurveFitter {
     public static class FitResult {
         public final FormulaType type;
         public final double[] params;
-        public final double relativeRMSE; // RMSE as percentage of mean position
+        public final double rSquared; // R² coefficient of determination (0 to 1, higher is better)
         public final long etaMs; // Estimated time to position 0 (ms from now), -1 if invalid
         public final boolean valid;
 
-        public FitResult(FormulaType type, double[] params, double relativeRMSE, long etaMs, boolean valid) {
+        public FitResult(FormulaType type, double[] params, double rSquared, long etaMs, boolean valid) {
             this.type = type;
             this.params = params;
-            this.relativeRMSE = relativeRMSE;
+            this.rSquared = rSquared;
             this.etaMs = etaMs;
             this.valid = valid;
         }
@@ -79,13 +84,13 @@ public class MultiFormulaCurveFitter {
      */
     public static class MultiResult {
         public final List<FitResult> results;
-        public final FitResult best; // Best result by RMSE (if any valid)
+        public final FitResult best; // Best result by R² (if any valid)
 
         public MultiResult(List<FitResult> results) {
             this.results = results;
             this.best = results.stream()
                     .filter(r -> r.valid && r.etaMs > 0)
-                    .min(Comparator.comparingDouble(r -> r.relativeRMSE))
+                    .max(Comparator.comparingDouble(r -> r.rSquared))
                     .orElse(null);
         }
 
@@ -96,7 +101,7 @@ public class MultiFormulaCurveFitter {
         public List<FitResult> getValidResults() {
             return results.stream()
                     .filter(r -> r.valid && r.etaMs > 0)
-                    .sorted(Comparator.comparingDouble(r -> r.relativeRMSE))
+                    .sorted(Comparator.comparingDouble(r -> -r.rSquared))
                     .toList();
         }
     }
@@ -117,7 +122,7 @@ public class MultiFormulaCurveFitter {
             return new MultiResult(results);
         }
 
-        // Prepare data
+        // Prepare data for ALL formulas
         final int n = dataPoints.size();
         final double[] times = new double[n];
         final double[] positions = new double[n];
@@ -135,28 +140,109 @@ public class MultiFormulaCurveFitter {
         long currentTimeMs = System.currentTimeMillis();
         long sessionStartTime = currentTimeMs - dataPoints.get(n - 1).timestamp;
 
-        // Try each enabled formula
-        if (config.isLinearEnabled()) {
-            results.add(fitLinear(times, positions, finalMeanPosition, sessionStartTime));
+        // Prepare WINDOWED data for linear fit
+        int linearWindowMinutes = config.getLinearWindowMinutes();
+        long windowMs = linearWindowMinutes * 60 * 1000L;
+        long cutoffTime = dataPoints.get(n - 1).timestamp - windowMs;
+
+        // Find first index within the window
+        int windowStartIdx = 0;
+        for (int i = 0; i < n; i++) {
+            if (dataPoints.get(i).timestamp >= cutoffTime) {
+                windowStartIdx = i;
+                break;
+            }
         }
 
+        // Create windowed arrays for linear fit
+        int windowN = n - windowStartIdx;
+        final double[] windowedTimes = new double[windowN];
+        final double[] windowedPositions = new double[windowN];
+        double windowedMeanPosition = 0;
+
+        for (int i = 0; i < windowN; i++) {
+            windowedTimes[i] = (dataPoints.get(windowStartIdx + i).timestamp - t0) / TIME_SCALE;
+            windowedPositions[i] = dataPoints.get(windowStartIdx + i).position;
+            windowedMeanPosition += windowedPositions[i];
+        }
+        windowedMeanPosition /= windowN;
+
+        if (windowN < n) {
+            QueueEstimatorMod.LOGGER.info("Linear fit using windowed data: {} of {} points (last {} min)",
+                    windowN, n, linearWindowMinutes);
+        }
+
+        // Fit LINEAR FIRST to get baseline ETA for validation
+        FitResult linearResult = null;
+        long linearEtaMs = -1;
+
+        if (config.isLinearEnabled()) {
+            linearResult = fitLinear(windowedTimes, windowedPositions, windowedMeanPosition, sessionStartTime);
+            results.add(linearResult);
+            if (linearResult.valid && linearResult.etaMs > 0) {
+                linearEtaMs = linearResult.etaMs;
+            }
+        }
+
+        // Fit other formulas using FULL data (they can capture long-term trends better)
         if (config.isQuadraticEnabled()) {
-            results.add(fitQuadratic(times, positions, finalMeanPosition, sessionStartTime));
+            FitResult result = fitQuadratic(times, positions, finalMeanPosition, sessionStartTime);
+            result = validateAgainstLinear(result, linearEtaMs);
+            results.add(result);
         }
 
         if (config.isExponentialEnabled()) {
-            results.add(fitExponential(times, positions, finalMeanPosition, sessionStartTime));
+            FitResult result = fitExponential(times, positions, finalMeanPosition, sessionStartTime);
+            result = validateAgainstLinear(result, linearEtaMs);
+            results.add(result);
         }
 
         if (config.isPowerLawEnabled()) {
-            results.add(fitPowerLaw(times, positions, finalMeanPosition, sessionStartTime));
+            FitResult result = fitPowerLaw(times, positions, finalMeanPosition, sessionStartTime);
+            result = validateAgainstLinear(result, linearEtaMs);
+            results.add(result);
         }
 
         if (config.isLogarithmicEnabled()) {
-            results.add(fitLogarithmic(times, positions, finalMeanPosition, sessionStartTime));
+            FitResult result = fitLogarithmic(times, positions, finalMeanPosition, sessionStartTime);
+            result = validateAgainstLinear(result, linearEtaMs);
+            results.add(result);
+        }
+
+        if (config.isTangentEnabled()) {
+            FitResult result = fitTangent(times, positions, finalMeanPosition, sessionStartTime);
+            result = validateAgainstLinear(result, linearEtaMs);
+            results.add(result);
+        }
+
+        if (config.isHyperbolicEnabled()) {
+            FitResult result = fitHyperbolic(times, positions, finalMeanPosition, sessionStartTime);
+            result = validateAgainstLinear(result, linearEtaMs);
+            results.add(result);
         }
 
         return new MultiResult(results);
+    }
+
+    /**
+     * Validate a non-linear fit result against the linear baseline.
+     * If a nonlinear fit predicts a shorter ETA than linear, it's unrealistic
+     * (the queue can't drain faster than linear extrapolation).
+     */
+    private FitResult validateAgainstLinear(FitResult result, long linearEtaMs) {
+        if (!result.valid || result.etaMs <= 0 || linearEtaMs <= 0) {
+            return result;
+        }
+
+        // If nonlinear ETA is less than linear ETA, reject it
+        if (result.etaMs < linearEtaMs) {
+            QueueEstimatorMod.LOGGER.warn(
+                    "{}: ETA of {} ms is less than linear ETA of {} ms, rejecting (unrealistic acceleration)",
+                    result.type.displayName, result.etaMs, linearEtaMs);
+            return new FitResult(result.type, result.params, result.rSquared, -1, false);
+        }
+
+        return result;
     }
 
     /**
@@ -178,7 +264,7 @@ public class MultiFormulaCurveFitter {
 
             double denom = n * sumT2 - sumT * sumT;
             if (Math.abs(denom) < 1e-10) {
-                return new FitResult(FormulaType.LINEAR, new double[] { 0, 0 }, 100, -1, false);
+                return new FitResult(FormulaType.LINEAR, new double[] { 0, 0 }, 0, -1, false);
             }
 
             double B = (n * sumTP - sumT * sumP) / denom;
@@ -189,15 +275,17 @@ public class MultiFormulaCurveFitter {
             // Actually we defined it as A - B*t, so B should be positive for decreasing
             B = -B; // Convert from slope to rate
 
-            // Calculate RMSE
-            double sse = 0;
+            // Calculate R² (coefficient of determination)
+            double sse = 0; // Sum of squared errors
+            double sst = 0; // Total sum of squares
             for (int i = 0; i < n; i++) {
                 double predicted = A - B * times[i];
                 double error = positions[i] - predicted;
                 sse += error * error;
+                double devFromMean = positions[i] - meanPos;
+                sst += devFromMean * devFromMean;
             }
-            double rmse = Math.sqrt(sse / n);
-            double relRMSE = (meanPos > 0) ? (rmse / meanPos) * 100 : 100;
+            double rSquared = (sst > 0) ? 1.0 - (sse / sst) : 0;
 
             // Calculate ETA: when does A - B*t = 0? t = A/B
             long etaMs = -1;
@@ -208,29 +296,31 @@ public class MultiFormulaCurveFitter {
                     etaMs = -1;
             }
 
-            QueueEstimatorMod.LOGGER.debug("Linear fit: A={}, B={}, RMSE%={}",
-                    formatNumber(A), formatNumber(B), String.format("%.2f", relRMSE));
+            QueueEstimatorMod.LOGGER.info("Linear fit: A={}, B={}, R²={}, etaMs={}",
+                    formatNumber(A), formatNumber(B), String.format("%.4f", rSquared), etaMs);
 
-            return new FitResult(FormulaType.LINEAR, new double[] { A, B }, relRMSE, etaMs, true);
+            return new FitResult(FormulaType.LINEAR, new double[] { A, B }, rSquared, validateEta(etaMs, "Linear"),
+                    true);
 
         } catch (Exception e) {
-            QueueEstimatorMod.LOGGER.debug("Linear fit failed: {}", e.getMessage());
-            return new FitResult(FormulaType.LINEAR, new double[] { 0, 0 }, 100, -1, false);
+            QueueEstimatorMod.LOGGER.info("Linear fit failed: {}", e.getMessage());
+            return new FitResult(FormulaType.LINEAR, new double[] { 0, 0 }, 0, -1, false);
         }
     }
 
     /**
-     * Quadratic fit: P(t) = A - B*t - C*t²
+     * Quadratic fit: P(t) = A + B*t + C*t²
+     * We fit a standard polynomial and then interpret: for decreasing queue,
+     * we expect B < 0 and possibly C > 0 (deceleration) or C < 0 (acceleration)
      */
     private FitResult fitQuadratic(double[] times, double[] positions, double meanPos, long sessionStart) {
         try {
             int n = positions.length;
 
-            // Use normal equations for polynomial fitting
-            // Matrix form: [n, sum(t), sum(t²)] [A] [sum(P)]
-            // [sum(t), sum(t²), sum(t³)] [B] = [sum(t*P)]
-            // [sum(t²), sum(t³), sum(t⁴)] [C] [sum(t²*P)]
+            QueueEstimatorMod.LOGGER.info("Quadratic fit starting with {} points", n);
 
+            // Use normal equations for polynomial fitting: P = A + B*t + C*t²
+            // This is the standard form - we'll interpret later
             double s0 = n, s1 = 0, s2 = 0, s3 = 0, s4 = 0;
             double sp0 = 0, sp1 = 0, sp2 = 0;
 
@@ -250,62 +340,114 @@ public class MultiFormulaCurveFitter {
                 sp2 += t2 * p;
             }
 
-            // Solve 3x3 system using Cramer's rule
+            QueueEstimatorMod.LOGGER.info("Quadratic sums: s0={}, s1={}, s2={}, s3={}, s4={}",
+                    s0, formatNumber(s1), formatNumber(s2), formatNumber(s3), formatNumber(s4));
+            QueueEstimatorMod.LOGGER.info("Quadratic position sums: sp0={}, sp1={}, sp2={}",
+                    formatNumber(sp0), formatNumber(sp1), formatNumber(sp2));
+
+            // Solve 3x3 system: [s0 s1 s2] [A] [sp0]
+            // [s1 s2 s3] [B] = [sp1]
+            // [s2 s3 s4] [C] [sp2]
+            // Using Cramer's rule
             double det = s0 * (s2 * s4 - s3 * s3) - s1 * (s1 * s4 - s2 * s3) + s2 * (s1 * s3 - s2 * s2);
+
+            QueueEstimatorMod.LOGGER.info("Quadratic determinant: {}", formatNumber(det));
+
             if (Math.abs(det) < 1e-10) {
-                return new FitResult(FormulaType.QUADRATIC, new double[] { 0, 0, 0 }, 100, -1, false);
+                QueueEstimatorMod.LOGGER.info("Quadratic fit failed: determinant too small ({})", det);
+                return new FitResult(FormulaType.QUADRATIC, new double[] { 0, 0, 0 }, 0, -1, false);
             }
 
-            double A = (sp0 * (s2 * s4 - s3 * s3) - s1 * (sp1 * s4 - sp2 * s3) + s2 * (sp1 * s3 - sp2 * s2)) / det;
-            double negB = (s0 * (sp1 * s4 - sp2 * s3) - sp0 * (s1 * s4 - s2 * s3) + s2 * (s1 * sp2 - s2 * sp1)) / det;
-            double negC = (s0 * (s2 * sp2 - s3 * sp1) - s1 * (s1 * sp2 - s2 * sp1) + sp0 * (s1 * s3 - s2 * s2)) / det;
+            // Cramer's rule for A (replace first column with sp vector)
+            double detA = sp0 * (s2 * s4 - s3 * s3) - s1 * (sp1 * s4 - sp2 * s3) + s2 * (sp1 * s3 - sp2 * s2);
+            // Cramer's rule for B (replace second column)
+            double detB = s0 * (sp1 * s4 - sp2 * s3) - sp0 * (s1 * s4 - s2 * s3) + s2 * (s1 * sp2 - s2 * sp1);
+            // Cramer's rule for C (replace third column)
+            double detC = s0 * (s2 * sp2 - s3 * sp1) - s1 * (s1 * sp2 - s2 * sp1) + sp0 * (s1 * s3 - s2 * s2);
 
-            double B = -negB;
-            double C = -negC;
+            double A = detA / det;
+            double B = detB / det;
+            double C = detC / det;
 
-            // Calculate RMSE
-            double sse = 0;
+            QueueEstimatorMod.LOGGER.info("Quadratic raw coefficients: A={}, B={}, C={}",
+                    formatNumber(A), formatNumber(B), formatNumber(C));
+
+            // Calculate R² (coefficient of determination)
+            double sse = 0; // Sum of squared errors
+            double sst = 0; // Total sum of squares
             for (int i = 0; i < n; i++) {
-                double predicted = A - B * times[i] - C * times[i] * times[i];
+                double predicted = A + B * times[i] + C * times[i] * times[i];
                 double error = positions[i] - predicted;
                 sse += error * error;
+                double devFromMean = positions[i] - meanPos;
+                sst += devFromMean * devFromMean;
             }
-            double rmse = Math.sqrt(sse / n);
-            double relRMSE = (meanPos > 0) ? (rmse / meanPos) * 100 : 100;
+            double rSquared = (sst > 0) ? 1.0 - (sse / sst) : 0;
 
-            // Calculate ETA: solve A - B*t - C*t² = 0 using quadratic formula
-            // C*t² + B*t - A = 0 => t = (-B ± sqrt(B² + 4CA)) / (2C)
+            QueueEstimatorMod.LOGGER.info("Quadratic R²: {}", String.format("%.4f", rSquared));
+
+            // Calculate ETA: solve A + B*t + C*t² = 0 using quadratic formula
+            // C*t² + B*t + A = 0 => t = (-B ± sqrt(B² - 4CA)) / (2C)
             long etaMs = -1;
+            double currentT = times[n - 1];
+
             if (Math.abs(C) > 1e-10) {
-                double discriminant = B * B + 4 * C * A;
+                double discriminant = B * B - 4 * C * A;
+                QueueEstimatorMod.LOGGER.info("Quadratic discriminant for ETA: {}", formatNumber(discriminant));
+
                 if (discriminant >= 0) {
-                    double t1 = (-B + Math.sqrt(discriminant)) / (2 * C);
-                    double t2 = (-B - Math.sqrt(discriminant)) / (2 * C);
-                    double tZero = (t1 > 0) ? t1 : t2;
+                    double sqrtDisc = Math.sqrt(discriminant);
+                    double t1 = (-B + sqrtDisc) / (2 * C);
+                    double t2 = (-B - sqrtDisc) / (2 * C);
+
+                    QueueEstimatorMod.LOGGER.info("Quadratic roots: t1={}, t2={}", formatNumber(t1), formatNumber(t2));
+
+                    // Pick the positive root that's in the future
+                    double tZero = -1;
+                    if (t1 > currentT)
+                        tZero = t1;
+                    if (t2 > currentT && (tZero < 0 || t2 < tZero))
+                        tZero = t2;
+
                     if (tZero > 0) {
-                        etaMs = (long) (tZero * TIME_SCALE) - dataPoints.get(dataPoints.size() - 1).timestamp;
-                        if (etaMs < 0)
-                            etaMs = -1;
+                        // Convert from time since start to time remaining
+                        double timeRemaining = tZero - currentT;
+                        etaMs = (long) (timeRemaining * TIME_SCALE);
+                        QueueEstimatorMod.LOGGER.info("Quadratic ETA: tZero={}, timeRemaining={} min, etaMs={}",
+                                formatNumber(tZero), formatNumber(timeRemaining), etaMs);
+                    } else {
+                        QueueEstimatorMod.LOGGER.warn("Quadratic: both roots are in the past, no valid ETA");
+                    }
+                } else {
+                    // Negative discriminant - parabola doesn't cross zero
+                    if (C > 0) {
+                        QueueEstimatorMod.LOGGER
+                                .warn("Quadratic: parabola opens upward and never reaches zero (no real roots)");
+                    } else {
+                        QueueEstimatorMod.LOGGER
+                                .warn("Quadratic: parabola opens downward but minimum is above zero (no real roots)");
                     }
                 }
-            } else if (B > 0) {
-                // Degenerate to linear
-                double tZero = A / B;
-                if (tZero > 0) {
-                    etaMs = (long) (tZero * TIME_SCALE) - dataPoints.get(dataPoints.size() - 1).timestamp;
-                    if (etaMs < 0)
-                        etaMs = -1;
+            } else if (Math.abs(B) > 1e-10) {
+                // Degenerate to linear: B*t + A = 0 => t = -A/B
+                double tZero = -A / B;
+                if (tZero > currentT) {
+                    double timeRemaining = tZero - currentT;
+                    etaMs = (long) (timeRemaining * TIME_SCALE);
                 }
+                QueueEstimatorMod.LOGGER.info("Quadratic degenerated to linear, tZero={}", formatNumber(tZero));
             }
 
-            QueueEstimatorMod.LOGGER.debug("Quadratic fit: A={}, B={}, C={}, RMSE%={}",
-                    formatNumber(A), formatNumber(B), formatNumber(C), String.format("%.2f", relRMSE));
+            QueueEstimatorMod.LOGGER.info("Quadratic fit complete: A={}, B={}, C={}, R²={}, etaMs={}",
+                    formatNumber(A), formatNumber(B), formatNumber(C), String.format("%.4f", rSquared), etaMs);
 
-            return new FitResult(FormulaType.QUADRATIC, new double[] { A, B, C }, relRMSE, etaMs, true);
+            return new FitResult(FormulaType.QUADRATIC, new double[] { A, B, C }, rSquared,
+                    validateEta(etaMs, "Quadratic"), true);
 
         } catch (Exception e) {
-            QueueEstimatorMod.LOGGER.debug("Quadratic fit failed: {}", e.getMessage());
-            return new FitResult(FormulaType.QUADRATIC, new double[] { 0, 0, 0 }, 100, -1, false);
+            QueueEstimatorMod.LOGGER.info("Quadratic fit failed with exception: {}", e.getMessage());
+            e.printStackTrace();
+            return new FitResult(FormulaType.QUADRATIC, new double[] { 0, 0, 0 }, 0, -1, false);
         }
     }
 
@@ -361,9 +503,17 @@ public class MultiFormulaCurveFitter {
             B = result[1];
             C = result[2];
 
-            // Calculate RMSE
-            double rmse = optimum.getRMS();
-            double relRMSE = (meanPos > 0) ? (rmse / meanPos) * 100 : 100;
+            // Calculate R² (coefficient of determination)
+            double sse = 0; // Sum of squared errors
+            double sst = 0; // Total sum of squares
+            for (int i = 0; i < n; i++) {
+                double predicted = A * Math.exp(-B * times[i]) - C;
+                double error = positions[i] - predicted;
+                sse += error * error;
+                double devFromMean = positions[i] - meanPos;
+                sst += devFromMean * devFromMean;
+            }
+            double rSquared = (sst > 0) ? 1.0 - (sse / sst) : 0;
 
             // Calculate ETA: A * e^(-B*t) = C => t = ln(A/C) / B
             long etaMs = -1;
@@ -383,14 +533,15 @@ public class MultiFormulaCurveFitter {
                 }
             }
 
-            QueueEstimatorMod.LOGGER.debug("Exponential fit: A={}, B={}, C={}, RMSE%={}",
-                    formatNumber(A), formatNumber(B), formatNumber(C), String.format("%.2f", relRMSE));
+            QueueEstimatorMod.LOGGER.info("Exponential fit: A={}, B={}, C={}, R²={}, etaMs={}",
+                    formatNumber(A), formatNumber(B), formatNumber(C), String.format("%.4f", rSquared), etaMs);
 
-            return new FitResult(FormulaType.EXPONENTIAL, new double[] { A, B, C }, relRMSE, etaMs, true);
+            return new FitResult(FormulaType.EXPONENTIAL, new double[] { A, B, C }, rSquared,
+                    validateEta(etaMs, "Exponential"), true);
 
         } catch (Exception e) {
-            QueueEstimatorMod.LOGGER.debug("Exponential fit failed: {}", e.getMessage());
-            return new FitResult(FormulaType.EXPONENTIAL, new double[] { 0, 0, 0 }, 100, -1, false);
+            QueueEstimatorMod.LOGGER.info("Exponential fit failed: {}", e.getMessage());
+            return new FitResult(FormulaType.EXPONENTIAL, new double[] { 0, 0, 0 }, 0, -1, false);
         }
     }
 
@@ -486,31 +637,49 @@ public class MultiFormulaCurveFitter {
             double B = result[1];
             double C = result[2];
 
-            double rmse = optimum.getRMS();
-            double relRMSE = (meanPos > 0) ? (rmse / meanPos) * 100 : 100;
+            // Calculate R² (coefficient of determination)
+            double sse = 0; // Sum of squared errors
+            double sst = 0; // Total sum of squares
+            for (int i = 0; i < n; i++) {
+                double predicted = A * Math.pow(times[i] + 1, -B) + C;
+                double error = positions[i] - predicted;
+                sse += error * error;
+                double devFromMean = positions[i] - meanPos;
+                sst += devFromMean * devFromMean;
+            }
+            double rSquared = (sst > 0) ? 1.0 - (sse / sst) : 0;
 
             // Calculate ETA: A*(t+1)^(-B) + C = 0 => (t+1)^(-B) = -C/A
-            // Only valid if C < 0 (which we don't allow) - use tangent approximation
+            // Only valid if C < 0, which means (t+1)^(-B) = -C/A > 0
+            // Then t+1 = (-C/A)^(-1/B) = (-A/C)^(1/B), so t = (-A/C)^(1/B) - 1
             long etaMs = -1;
-            if (B > 0 && A > 0) {
-                // Use tangent at current point
+            if (C < 0 && A > 0 && B > 0) {
+                double ratio = -A / C; // This is positive since C < 0
+                double tZero = Math.pow(ratio, 1.0 / B) - 1;
                 double currentT = times[n - 1];
-                double currentP = positions[n - 1];
-                double slope = -A * B * Math.pow(currentT + 1, -B - 1);
-                if (slope < 0 && currentP > 0) {
-                    double tRemaining = -currentP / slope;
-                    etaMs = (long) (tRemaining * TIME_SCALE);
+                if (tZero > currentT) {
+                    double timeRemaining = tZero - currentT;
+                    etaMs = (long) (timeRemaining * TIME_SCALE);
+                    QueueEstimatorMod.LOGGER.info("Power law ETA: tZero={}, timeRemaining={} min",
+                            formatNumber(tZero), formatNumber(timeRemaining));
+                } else {
+                    QueueEstimatorMod.LOGGER.warn("Power law: root is in the past, no valid ETA");
                 }
+            } else {
+                QueueEstimatorMod.LOGGER.warn(
+                        "Power law: no closed-form ETA exists (C={} must be < 0 for curve to cross zero)",
+                        formatNumber(C));
             }
 
-            QueueEstimatorMod.LOGGER.debug("Power law fit: A={}, B={}, C={}, RMSE%={}",
-                    formatNumber(A), formatNumber(B), formatNumber(C), String.format("%.2f", relRMSE));
+            QueueEstimatorMod.LOGGER.info("Power law fit: A={}, B={}, C={}, R²={}, etaMs={}",
+                    formatNumber(A), formatNumber(B), formatNumber(C), String.format("%.4f", rSquared), etaMs);
 
-            return new FitResult(FormulaType.POWER_LAW, new double[] { A, B, C }, relRMSE, etaMs, true);
+            return new FitResult(FormulaType.POWER_LAW, new double[] { A, B, C }, rSquared,
+                    validateEta(etaMs, "Power Law"), true);
 
         } catch (Exception e) {
-            QueueEstimatorMod.LOGGER.debug("Power law fit failed: {}", e.getMessage());
-            return new FitResult(FormulaType.POWER_LAW, new double[] { 0, 0, 0 }, 100, -1, false);
+            QueueEstimatorMod.LOGGER.info("Power law fit failed: {}", e.getMessage());
+            return new FitResult(FormulaType.POWER_LAW, new double[] { 0, 0, 0 }, 0, -1, false);
         }
     }
 
@@ -533,43 +702,329 @@ public class MultiFormulaCurveFitter {
 
             double denom = n * sumX2 - sumX * sumX;
             if (Math.abs(denom) < 1e-10) {
-                return new FitResult(FormulaType.LOGARITHMIC, new double[] { 0, 0 }, 100, -1, false);
+                return new FitResult(FormulaType.LOGARITHMIC, new double[] { 0, 0 }, 0, -1, false);
             }
 
             double B = -(n * sumXP - sumX * sumP) / denom; // Note the negative for our formula
             double A = (sumP + B * sumX) / n;
 
-            // Calculate RMSE
-            double sse = 0;
+            // Calculate R² (coefficient of determination)
+            double sse = 0; // Sum of squared errors
+            double sst = 0; // Total sum of squares
             for (int i = 0; i < n; i++) {
                 double predicted = A - B * Math.log(times[i] + 1);
                 double error = positions[i] - predicted;
                 sse += error * error;
+                double devFromMean = positions[i] - meanPos;
+                sst += devFromMean * devFromMean;
             }
-            double rmse = Math.sqrt(sse / n);
-            double relRMSE = (meanPos > 0) ? (rmse / meanPos) * 100 : 100;
+            double rSquared = (sst > 0) ? 1.0 - (sse / sst) : 0;
 
             // Calculate ETA: A - B*ln(t+1) = 0 => ln(t+1) = A/B => t = e^(A/B) - 1
+            // tZero is in scaled time (minutes), currentT is also in scaled time
+            // 1 week = 10080 minutes, ln(10080) ≈ 9.2, so ratio > 10 means ETA > 1 week
             long etaMs = -1;
             if (B > 0 && A > 0) {
                 double ratio = A / B;
-                if (ratio < 50) { // Prevent overflow
-                    double tZero = Math.exp(ratio) - 1;
-                    etaMs = (long) (tZero * TIME_SCALE) - dataPoints.get(dataPoints.size() - 1).timestamp;
-                    if (etaMs < 0)
-                        etaMs = -1;
+                if (ratio > 15) {
+                    // e^15 ≈ 3.3 million minutes, way beyond reasonable
+                    QueueEstimatorMod.LOGGER.warn(
+                            "Logarithmic: ratio A/B = {} is too large (e^{} would overflow), no valid ETA",
+                            formatNumber(ratio), formatNumber(ratio));
+                } else {
+                    double tZero = Math.exp(ratio) - 1; // absolute time in minutes when P=0
+                    double currentT = times[n - 1]; // current time in minutes
+                    if (tZero > currentT) {
+                        double timeRemaining = tZero - currentT; // remaining time in minutes
+                        etaMs = (long) (timeRemaining * TIME_SCALE);
+                    } else {
+                        QueueEstimatorMod.LOGGER.warn(
+                                "Logarithmic: tZero={} is in the past (currentT={}), no valid ETA",
+                                formatNumber(tZero), formatNumber(currentT));
+                    }
+                }
+            } else {
+                QueueEstimatorMod.LOGGER.warn("Logarithmic: invalid parameters A={}, B={} (both must be > 0)",
+                        formatNumber(A), formatNumber(B));
+            }
+
+            QueueEstimatorMod.LOGGER.info("Logarithmic fit: A={}, B={}, ratio={}, R²={}, etaMs={}",
+                    formatNumber(A), formatNumber(B), formatNumber(A / B), String.format("%.4f", rSquared), etaMs);
+
+            return new FitResult(FormulaType.LOGARITHMIC, new double[] { A, B }, rSquared,
+                    validateEta(etaMs, "Logarithmic"), true);
+
+        } catch (Exception e) {
+            QueueEstimatorMod.LOGGER.info("Logarithmic fit failed: {}", e.getMessage());
+            return new FitResult(FormulaType.LOGARITHMIC, new double[] { 0, 0 }, 0, -1, false);
+        }
+    }
+
+    /**
+     * Tangent fit: P(t) = A * tan(B - k*t) - D
+     * This is the solution to dP/dt = -c*(P + a*P²) where the P² term
+     * represents position-dependent dropout rates.
+     * Uses Levenberg-Marquardt optimization with 4 parameters.
+     */
+    private FitResult fitTangent(double[] times, double[] positions, double meanPos, long sessionStart) {
+        try {
+            int n = positions.length;
+
+            if (n < 5) {
+                QueueEstimatorMod.LOGGER.info("Tangent fit needs at least 5 points, got {}", n);
+                return new FitResult(FormulaType.TANGENT, new double[] { 0, 0, 0, 0 }, 0, -1, false);
+            }
+
+            // Initial guesses for A, B, k, D (all must be > 0)
+            // P(t) = A * tan(B - k*t) - D
+            // At t=0: P(0) = A * tan(B) - D
+            // At t_end: P approaches 0 when B - k*t_end approaches arctan(D/A)
+            double initA = positions[0] / 2;
+            double initB = Math.PI / 4; // Start at 45 degrees
+            double initK = 0.1; // Moderate decay rate
+            double initD = positions[0] / 4; // Positive offset
+
+            double[] initialGuess = { initA, initB, initK, initD };
+
+            ParameterValidator validator = params -> {
+                double pA = Math.max(1.0, params.getEntry(0)); // A > 0 (amplitude)
+                double pB = Math.max(0.01, Math.min(params.getEntry(1), Math.PI / 2 - 0.01)); // 0 < B < π/2
+                double pK = Math.max(1e-6, Math.min(params.getEntry(2), 2.0)); // k > 0 (decay rate)
+                double pD = Math.max(0.0, params.getEntry(3)); // D >= 0 (offset)
+                return new ArrayRealVector(new double[] { pA, pB, pK, pD });
+            };
+
+            MultivariateJacobianFunction model = point -> {
+                double pA = point.getEntry(0);
+                double pB = point.getEntry(1);
+                double pK = point.getEntry(2);
+                double pD = point.getEntry(3);
+
+                RealVector value = new ArrayRealVector(n);
+                RealMatrix jacobian = new Array2DRowRealMatrix(n, 4);
+
+                for (int i = 0; i < n; i++) {
+                    double t = times[i];
+                    double angle = pB - pK * t;
+
+                    // Avoid singularities near ±π/2
+                    if (Math.abs(angle) > Math.PI / 2 - 0.1) {
+                        angle = Math.signum(angle) * (Math.PI / 2 - 0.1);
+                    }
+
+                    double tanVal = Math.tan(angle);
+                    double sec2Val = 1 + tanVal * tanVal; // sec²(x) = 1 + tan²(x)
+
+                    // P(t) = A * tan(B - k*t) - D
+                    value.setEntry(i, pA * tanVal - pD);
+
+                    // Jacobian:
+                    // dP/dA = tan(B - k*t)
+                    // dP/dB = A * sec²(B - k*t)
+                    // dP/dk = -A * t * sec²(B - k*t)
+                    // dP/dD = -1
+                    jacobian.setEntry(i, 0, tanVal);
+                    jacobian.setEntry(i, 1, pA * sec2Val);
+                    jacobian.setEntry(i, 2, -pA * t * sec2Val);
+                    jacobian.setEntry(i, 3, -1.0);
+                }
+
+                return new Pair<>(value, jacobian);
+            };
+
+            LeastSquaresProblem problem = new LeastSquaresBuilder()
+                    .start(initialGuess)
+                    .model(model)
+                    .target(positions)
+                    .parameterValidator(validator)
+                    .maxEvaluations(5000)
+                    .maxIterations(2000)
+                    .build();
+
+            LevenbergMarquardtOptimizer optimizer = new LevenbergMarquardtOptimizer()
+                    .withCostRelativeTolerance(1e-8)
+                    .withParameterRelativeTolerance(1e-8);
+
+            LeastSquaresOptimizer.Optimum optimum = optimizer.optimize(problem);
+            double[] result = optimum.getPoint().toArray();
+
+            double A = result[0];
+            double B = result[1];
+            double k = result[2];
+            double D = result[3];
+
+            // Calculate R² (coefficient of determination)
+            double sse = 0; // Sum of squared errors
+            double sst = 0; // Total sum of squares
+            for (int i = 0; i < n; i++) {
+                double predicted = A * Math.tan(B - k * times[i]) - D;
+                double error = positions[i] - predicted;
+                sse += error * error;
+                double devFromMean = positions[i] - meanPos;
+                sst += devFromMean * devFromMean;
+            }
+            double rSquared = (sst > 0) ? 1.0 - (sse / sst) : 0;
+
+            // Calculate ETA: A * tan(B - k*t) - D = 0
+            // tan(B - k*t) = D/A
+            // B - k*t = arctan(D/A)
+            // t = (B - arctan(D/A)) / k
+            long etaMs = -1;
+            if (k > 0 && A != 0) {
+                double tZero = (B - Math.atan(D / A)) / k;
+                double currentT = times[n - 1];
+                if (tZero > currentT) {
+                    double timeRemaining = tZero - currentT;
+                    etaMs = (long) (timeRemaining * TIME_SCALE);
                 }
             }
 
-            QueueEstimatorMod.LOGGER.debug("Logarithmic fit: A={}, B={}, RMSE%={}",
-                    formatNumber(A), formatNumber(B), String.format("%.2f", relRMSE));
+            QueueEstimatorMod.LOGGER.info("Tangent fit: A={}, B={}, k={}, D={}, R²={}, etaMs={}",
+                    formatNumber(A), formatNumber(B), formatNumber(k), formatNumber(D),
+                    String.format("%.4f", rSquared), etaMs);
 
-            return new FitResult(FormulaType.LOGARITHMIC, new double[] { A, B }, relRMSE, etaMs, true);
+            return new FitResult(FormulaType.TANGENT, new double[] { A, B, k, D }, rSquared,
+                    validateEta(etaMs, "Tangent"), true);
 
         } catch (Exception e) {
-            QueueEstimatorMod.LOGGER.debug("Logarithmic fit failed: {}", e.getMessage());
-            return new FitResult(FormulaType.LOGARITHMIC, new double[] { 0, 0 }, 100, -1, false);
+            QueueEstimatorMod.LOGGER.info("Tangent fit failed: {}", e.getMessage());
+            return new FitResult(FormulaType.TANGENT, new double[] { 0, 0, 0, 0 }, 0, -1, false);
         }
+    }
+
+    /**
+     * Hyperbolic fit: P(t) = A/(t+B) - C
+     * This models queue progression where the rate slows down over time.
+     */
+    private FitResult fitHyperbolic(double[] times, double[] positions, double meanPos, long sessionStart) {
+        try {
+            int n = positions.length;
+
+            // Initial guesses
+            // At t=0: P(0) = A/B - C
+            // As t→∞: P → -C (should be 0 or small positive for valid queue)
+            double initA = positions[0] * times[n - 1]; // Rough estimate
+            double initB = 1.0;
+            double initC = 0;
+
+            double[] initialGuess = { initA, initB, initC };
+
+            ParameterValidator validator = params -> {
+                double pA = Math.max(1.0, params.getEntry(0));
+                double pB = Math.max(0.01, params.getEntry(1));
+                double pC = Math.max(0.0, params.getEntry(2));
+                return new ArrayRealVector(new double[] { pA, pB, pC });
+            };
+
+            MultivariateJacobianFunction model = point -> {
+                double pA = point.getEntry(0);
+                double pB = point.getEntry(1);
+                double pC = point.getEntry(2);
+
+                RealVector value = new ArrayRealVector(n);
+                RealMatrix jacobian = new Array2DRowRealMatrix(n, 3);
+
+                for (int i = 0; i < n; i++) {
+                    double t = times[i];
+                    double denom = t + pB;
+                    if (denom < 0.01)
+                        denom = 0.01; // Prevent division issues
+
+                    // P(t) = A/(t+B) - C
+                    value.setEntry(i, pA / denom - pC);
+
+                    // Jacobian:
+                    // dP/dA = 1/(t+B)
+                    // dP/dB = -A/(t+B)²
+                    // dP/dC = -1
+                    jacobian.setEntry(i, 0, 1.0 / denom);
+                    jacobian.setEntry(i, 1, -pA / (denom * denom));
+                    jacobian.setEntry(i, 2, -1.0);
+                }
+
+                return new Pair<>(value, jacobian);
+            };
+
+            LeastSquaresProblem problem = new LeastSquaresBuilder()
+                    .start(initialGuess)
+                    .model(model)
+                    .target(positions)
+                    .parameterValidator(validator)
+                    .maxEvaluations(3000)
+                    .maxIterations(1000)
+                    .build();
+
+            LevenbergMarquardtOptimizer optimizer = new LevenbergMarquardtOptimizer()
+                    .withCostRelativeTolerance(1e-8)
+                    .withParameterRelativeTolerance(1e-8);
+
+            LeastSquaresOptimizer.Optimum optimum = optimizer.optimize(problem);
+            double[] result = optimum.getPoint().toArray();
+
+            double A = result[0];
+            double B = result[1];
+            double C = result[2];
+
+            // Calculate R² (coefficient of determination)
+            double sse = 0; // Sum of squared errors
+            double sst = 0; // Total sum of squares
+            for (int i = 0; i < n; i++) {
+                double predicted = A / (times[i] + B) - C;
+                double error = positions[i] - predicted;
+                sse += error * error;
+                double devFromMean = positions[i] - meanPos;
+                sst += devFromMean * devFromMean;
+            }
+            double rSquared = (sst > 0) ? 1.0 - (sse / sst) : 0;
+
+            // Calculate ETA: A/(t+B) - C = 0
+            // A/(t+B) = C
+            // t + B = A/C
+            // t = A/C - B
+            long etaMs = -1;
+            if (C > 0 && A > 0) {
+                double tZero = A / C - B;
+                double currentT = times[n - 1];
+                if (tZero > currentT) {
+                    double timeRemaining = tZero - currentT;
+                    etaMs = (long) (timeRemaining * TIME_SCALE);
+                }
+            } else if (C <= 0) {
+                // Without offset, use tangent approximation
+                double currentT = times[n - 1];
+                double currentP = positions[n - 1];
+                double slope = -A / ((currentT + B) * (currentT + B));
+                if (slope < 0 && currentP > 0) {
+                    double tRemaining = -currentP / slope;
+                    etaMs = (long) (tRemaining * TIME_SCALE);
+                }
+            }
+
+            QueueEstimatorMod.LOGGER.info("Hyperbolic fit: A={}, B={}, C={}, R²={}, etaMs={}",
+                    formatNumber(A), formatNumber(B), formatNumber(C), String.format("%.4f", rSquared), etaMs);
+
+            return new FitResult(FormulaType.HYPERBOLIC, new double[] { A, B, C }, rSquared,
+                    validateEta(etaMs, "Hyperbolic"), true);
+
+        } catch (Exception e) {
+            QueueEstimatorMod.LOGGER.info("Hyperbolic fit failed: {}", e.getMessage());
+            return new FitResult(FormulaType.HYPERBOLIC, new double[] { 0, 0, 0 }, 0, -1, false);
+        }
+    }
+
+    /**
+     * Validates ETA - returns -1 if ETA is negative or exceeds 1 week
+     */
+    private static long validateEta(long etaMs, String formulaName) {
+        if (etaMs <= 0) {
+            return -1;
+        }
+        if (etaMs > MAX_ETA_MS) {
+            QueueEstimatorMod.LOGGER.warn("{}: ETA of {} ms exceeds 1 week threshold, rejecting",
+                    formulaName, etaMs);
+            return -1;
+        }
+        return etaMs;
     }
 
     private static String formatNumber(double value) {
