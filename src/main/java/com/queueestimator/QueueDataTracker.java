@@ -223,24 +223,27 @@ public class QueueDataTracker {
         double currentRate = positionDelta / timeDeltaMinutes; // positions per minute
 
         // Log the rate
-        QueueEstimatorMod.LOGGER.info("Average rate over last {} min: {:.2f} positions/min (from {} to {})",
-                config.getRateTrackingIntervalMinutes(), currentRate, firstPoint.position, lastPoint.position);
+        QueueEstimatorMod.LOGGER.info("Average rate over last {} min: {} positions/min (from {} to {})",
+                config.getRateTrackingIntervalMinutes(), String.format("%.2f", currentRate), firstPoint.position,
+                lastPoint.position);
 
         // Send rate info to chat
         String rateStr = String.format("%.1f", currentRate);
         sendChatMessage(String.format("§7[Queue] Rate: §f%s §7pos/min over last %d min",
                 rateStr, config.getRateTrackingIntervalMinutes()));
 
-        // Compare with previous rate and warn if not improving
+        // Compare with previous rate and warn if rate increased (unexpected - usually
+        // indicates server issues)
+        // A decreasing rate is expected as queue naturally slows down
         if (lastAverageRate >= 0) {
-            if (currentRate <= lastAverageRate) {
-                QueueEstimatorMod.LOGGER.warn("Queue rate is not improving: {:.2f} pos/min (was {:.2f})",
-                        currentRate, lastAverageRate);
-                sendChatMessage(String.format("§e[Queue] Warning: Rate not improving (was %.1f, now %.1f pos/min)",
+            if (currentRate > lastAverageRate) {
+                QueueEstimatorMod.LOGGER.warn("Queue rate unexpectedly increased: {} pos/min (was {})",
+                        String.format("%.2f", currentRate), String.format("%.2f", lastAverageRate));
+                sendChatMessage(String.format("§e[Queue] Note: Rate increased (was %.1f, now %.1f pos/min)",
                         lastAverageRate, currentRate));
             } else {
-                QueueEstimatorMod.LOGGER.info("Queue rate improved: {:.2f} pos/min (was {:.2f})",
-                        currentRate, lastAverageRate);
+                QueueEstimatorMod.LOGGER.info("Queue rate: {} pos/min (was {})",
+                        String.format("%.2f", currentRate), String.format("%.2f", lastAverageRate));
             }
         }
 

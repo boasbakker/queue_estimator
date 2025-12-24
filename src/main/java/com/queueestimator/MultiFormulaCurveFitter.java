@@ -779,17 +779,34 @@ public class MultiFormulaCurveFitter {
             // P(t) = A * tan(B - k*t) - D
             // At t=0: P(0) = A * tan(B) - D
             // At t_end: P approaches 0 when B - k*t_end approaches arctan(D/A)
+            //
+            // Key constraint: B - k*t must stay in (-π/2 + margin, π/2 - margin) for all t
+            // At t=0: angle = B, so B < π/2 - margin
+            // At t=t_max: angle = B - k*t_max > -π/2 + margin
+            // Therefore: k < (B + π/2 - margin) / t_max
+
+            double tMax = times[n - 1];
+            double safeMargin = 0.3; // Stay 0.3 radians (~17°) away from asymptotes
+
+            double initB = Math.PI / 4; // Start at 45 degrees (0.785 rad)
+            // Ensure k doesn't push angles past the asymptote: k*t_max < B + π/2 - margin
+            double maxK = (initB + Math.PI / 2 - safeMargin) / Math.max(tMax, 1.0);
+            double initK = Math.min(0.1, maxK * 0.5); // Conservative initial k
             double initA = positions[0] / 2;
-            double initB = Math.PI / 4; // Start at 45 degrees
-            double initK = 0.1; // Moderate decay rate
             double initD = positions[0] / 4; // Positive offset
 
             double[] initialGuess = { initA, initB, initK, initD };
 
+            // Capture tMax for use in validator
+            final double finalTMax = tMax;
+            final double finalSafeMargin = safeMargin;
+
             ParameterValidator validator = params -> {
                 double pA = Math.max(1.0, params.getEntry(0)); // A > 0 (amplitude)
-                double pB = Math.max(0.01, Math.min(params.getEntry(1), Math.PI / 2 - 0.01)); // 0 < B < π/2
-                double pK = Math.max(1e-6, Math.min(params.getEntry(2), 2.0)); // k > 0 (decay rate)
+                double pB = Math.max(0.1, Math.min(params.getEntry(1), Math.PI / 2 - finalSafeMargin)); // Keep B safe
+                // Constrain k so that B - k*t_max > -π/2 + margin
+                double maxAllowedK = (pB + Math.PI / 2 - finalSafeMargin) / Math.max(finalTMax, 1.0);
+                double pK = Math.max(1e-6, Math.min(params.getEntry(2), maxAllowedK));
                 double pD = Math.max(0.0, params.getEntry(3)); // D >= 0 (offset)
                 return new ArrayRealVector(new double[] { pA, pB, pK, pD });
             };
@@ -854,16 +871,38 @@ public class MultiFormulaCurveFitter {
             double D = result[3];
 
             // Calculate R² (coefficient of determination)
+            // Use the same angle clamping as the model to avoid tan() explosions
             double sse = 0; // Sum of squared errors
             double sst = 0; // Total sum of squares
+            boolean hasInvalidAngle = false;
             for (int i = 0; i < n; i++) {
-                double predicted = A * Math.tan(B - k * times[i]) - D;
+                double angle = B - k * times[i];
+
+                // Check if any angle is dangerously close to asymptote
+                if (Math.abs(angle) > Math.PI / 2 - 0.2) {
+                    hasInvalidAngle = true;
+                }
+
+                // Clamp angle to avoid tan() explosion (same as model)
+                if (Math.abs(angle) > Math.PI / 2 - 0.1) {
+                    angle = Math.signum(angle) * (Math.PI / 2 - 0.1);
+                }
+
+                double predicted = A * Math.tan(angle) - D;
                 double error = positions[i] - predicted;
                 sse += error * error;
                 double devFromMean = positions[i] - meanPos;
                 sst += devFromMean * devFromMean;
             }
             double rSquared = (sst > 0) ? 1.0 - (sse / sst) : 0;
+
+            // Reject if fit required angle clamping (parameters are outside valid range)
+            if (hasInvalidAngle) {
+                QueueEstimatorMod.LOGGER.warn(
+                        "Tangent: fit has angles too close to asymptote (B={}, k={}, t_max={}), rejecting",
+                        formatNumber(B), formatNumber(k), formatNumber(times[n - 1]));
+                return new FitResult(FormulaType.TANGENT, new double[] { A, B, k, D }, rSquared, -1, false);
+            }
 
             // Calculate ETA: A * tan(B - k*t) - D = 0
             // tan(B - k*t) = D/A
@@ -882,6 +921,13 @@ public class MultiFormulaCurveFitter {
             QueueEstimatorMod.LOGGER.info("Tangent fit: A={}, B={}, k={}, D={}, R²={}, etaMs={}",
                     formatNumber(A), formatNumber(B), formatNumber(k), formatNumber(D),
                     String.format("%.4f", rSquared), etaMs);
+
+            // Reject if R² <= 0 (fit is worse than using the mean)
+            if (rSquared <= 0) {
+                QueueEstimatorMod.LOGGER.warn("Tangent: R²={} is <= 0, rejecting (fit worse than mean)",
+                        String.format("%.4f", rSquared));
+                return new FitResult(FormulaType.TANGENT, new double[] { A, B, k, D }, rSquared, -1, false);
+            }
 
             return new FitResult(FormulaType.TANGENT, new double[] { A, B, k, D }, rSquared,
                     validateEta(etaMs, "Tangent"), true);
@@ -1002,6 +1048,13 @@ public class MultiFormulaCurveFitter {
 
             QueueEstimatorMod.LOGGER.info("Hyperbolic fit: A={}, B={}, C={}, R²={}, etaMs={}",
                     formatNumber(A), formatNumber(B), formatNumber(C), String.format("%.4f", rSquared), etaMs);
+
+            // Reject if R² <= 0 (fit is worse than using the mean)
+            if (rSquared <= 0) {
+                QueueEstimatorMod.LOGGER.warn("Hyperbolic: R²={} is <= 0, rejecting (fit worse than mean)",
+                        String.format("%.4f", rSquared));
+                return new FitResult(FormulaType.HYPERBOLIC, new double[] { A, B, C }, rSquared, -1, false);
+            }
 
             return new FitResult(FormulaType.HYPERBOLIC, new double[] { A, B, C }, rSquared,
                     validateEta(etaMs, "Hyperbolic"), true);
