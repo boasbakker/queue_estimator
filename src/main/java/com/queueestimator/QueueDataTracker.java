@@ -56,7 +56,8 @@ public class QueueDataTracker {
     private static final long MIN_RECORD_INTERVAL_MS = 5000;
     
     // Maximum data points to keep (to prevent memory issues in very long queues)
-    private static final int MAX_DATA_POINTS = 1000;
+    // With 5-second intervals, 100000 points = ~139 hours
+    private static final int MAX_DATA_POINTS = 100000;
     
     private static final DateTimeFormatter TIME_FORMATTER = DateTimeFormatter.ofPattern("HH:mm:ss");
     
@@ -164,12 +165,11 @@ public class QueueDataTracker {
         // Check if it's time to log average rate
         checkRateTracking(currentTime, relativeTime);
 
-        // Try to estimate and display if we have enough data
-        QueueEstimatorConfig config = QueueEstimatorConfig.getInstance();
-        if (dataPoints.size() >= config.getMinDataPoints()) {
+        // Try to estimate and display if we have enough data (minimum 3 points)
+        if (dataPoints.size() >= 3) {
             estimateAndDisplay();
         } else {
-            int needed = config.getMinDataPoints() - dataPoints.size();
+            int needed = 3 - dataPoints.size();
             sendChatMessage(String.format("§7[Queue] Position: §f%d §7| Collecting data... §8(%d more needed)", 
                 position, needed));
         }
@@ -181,7 +181,7 @@ public class QueueDataTracker {
      */
     private void checkRateTracking(long currentTime, long relativeTime) {
         QueueEstimatorConfig config = QueueEstimatorConfig.getInstance();
-        long rateIntervalMs = config.getRateTrackingIntervalMinutes() * 60 * 1000L;
+        long rateIntervalMs = (long) (config.getRateTrackingIntervalHours() * 60 * 60 * 1000L);
 
         if (lastRateLogTime < 0 || (currentTime - lastRateLogTime) < rateIntervalMs) {
             return;
@@ -214,36 +214,36 @@ public class QueueDataTracker {
         DataPoint firstPoint = dataPoints.get(startIdx);
         DataPoint lastPoint = dataPoints.get(dataPoints.size() - 1);
 
-        double timeDeltaMinutes = (lastPoint.timestamp - firstPoint.timestamp) / 60000.0;
-        if (timeDeltaMinutes < 0.5) {
-            return; // Not enough time elapsed
+        double timeDeltaHours = (lastPoint.timestamp - firstPoint.timestamp) / 3600000.0;
+        if (timeDeltaHours < 0.1) {
+            return; // Not enough time elapsed (at least 6 minutes)
         }
 
         int positionDelta = firstPoint.position - lastPoint.position; // Positive means queue decreased
-        double currentRate = positionDelta / timeDeltaMinutes; // positions per minute
+        double currentRate = positionDelta / timeDeltaHours; // positions per hour
 
         // Log the rate
-        QueueEstimatorMod.LOGGER.info("Average rate over last {} min: {} positions/min (from {} to {})",
-                config.getRateTrackingIntervalMinutes(), String.format("%.2f", currentRate), firstPoint.position,
+        QueueEstimatorMod.LOGGER.info("Average rate over last {:.1f} hr: {} positions/hr (from {} to {})",
+                config.getRateTrackingIntervalHours(), String.format("%.1f", currentRate), firstPoint.position,
                 lastPoint.position);
 
         // Send rate info to chat
-        String rateStr = String.format("%.1f", currentRate);
-        sendChatMessage(String.format("§7[Queue] Rate: §f%s §7pos/min over last %d min",
-                rateStr, config.getRateTrackingIntervalMinutes()));
+        String rateStr = String.format("%.0f", currentRate);
+        sendChatMessage(String.format("§7[Queue] Rate: §f%s §7pos/hr over last %.1f hr",
+                rateStr, config.getRateTrackingIntervalHours()));
 
         // Compare with previous rate and warn if rate increased (unexpected - usually
         // indicates server issues)
         // A decreasing rate is expected as queue naturally slows down
         if (lastAverageRate >= 0) {
             if (currentRate > lastAverageRate) {
-                QueueEstimatorMod.LOGGER.warn("Queue rate unexpectedly increased: {} pos/min (was {})",
-                        String.format("%.2f", currentRate), String.format("%.2f", lastAverageRate));
-                sendChatMessage(String.format("§e[Queue] Note: Rate increased (was %.1f, now %.1f pos/min)",
+                QueueEstimatorMod.LOGGER.warn("Queue rate unexpectedly increased: {} pos/hr (was {})",
+                        String.format("%.1f", currentRate), String.format("%.1f", lastAverageRate));
+                sendChatMessage(String.format("§e[Queue] Note: Rate increased (was %.0f, now %.0f pos/hr)",
                         lastAverageRate, currentRate));
             } else {
-                QueueEstimatorMod.LOGGER.info("Queue rate: {} pos/min (was {})",
-                        String.format("%.2f", currentRate), String.format("%.2f", lastAverageRate));
+                QueueEstimatorMod.LOGGER.info("Queue rate: {} pos/hr (was {})",
+                        String.format("%.1f", currentRate), String.format("%.1f", lastAverageRate));
             }
         }
 

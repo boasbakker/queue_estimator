@@ -113,31 +113,31 @@ public class QueueEstimatorConfigScreen extends Screen {
                 }).dimensions(centerX - buttonWidth / 2, startY + spacing * 8, buttonWidth, buttonHeight).build();
         this.addDrawableChild(showAllButton);
 
-        // Min data points slider
-        MinDataPointsSlider slider = new MinDataPointsSlider(
+        // Ignore first minutes slider
+        IgnoreFirstMinutesSlider ignoreSlider = new IgnoreFirstMinutesSlider(
                 centerX - buttonWidth / 2,
                 startY + spacing * 9,
                 buttonWidth,
                 buttonHeight,
-                config.getMinDataPoints());
-        this.addDrawableChild(slider);
+                config.getIgnoreFirstMinutes());
+        this.addDrawableChild(ignoreSlider);
 
-        // Linear window minutes slider
+        // Linear window hours slider (0 = all data)
         LinearWindowSlider linearWindowSlider = new LinearWindowSlider(
                 centerX - buttonWidth / 2,
                 startY + spacing * 10,
                 buttonWidth,
                 buttonHeight,
-                config.getLinearWindowMinutes());
+                config.getLinearWindowHours());
         this.addDrawableChild(linearWindowSlider);
 
-        // Rate tracking interval slider
+        // Rate tracking interval slider (hours)
         RateTrackingSlider rateTrackingSlider = new RateTrackingSlider(
                 centerX - buttonWidth / 2,
                 startY + spacing * 11,
                 buttonWidth,
                 buttonHeight,
-                config.getRateTrackingIntervalMinutes());
+                config.getRateTrackingIntervalHours());
         this.addDrawableChild(rateTrackingSlider);
 
         // Done button
@@ -188,83 +188,92 @@ public class QueueEstimatorConfigScreen extends Screen {
     }
 
     /**
-     * Custom slider for minimum data points setting
+     * Custom slider for ignore first minutes setting
      */
-    private class MinDataPointsSlider extends SliderWidget {
+    private class IgnoreFirstMinutesSlider extends SliderWidget {
 
-        public MinDataPointsSlider(int x, int y, int width, int height, int initialValue) {
+        public IgnoreFirstMinutesSlider(int x, int y, int width, int height, int initialValue) {
             super(x, y, width, height,
-                    Text.literal("Min Data Points: " + initialValue),
-                    (initialValue - 3) / 17.0); // Normalize to 0-1 range (3 to 20)
+                    Text.literal("Ignore First: " + initialValue + " min"),
+                    initialValue / 60.0); // Normalize to 0-1 range (0 to 60)
         }
 
         @Override
         protected void updateMessage() {
             int value = getValue();
-            this.setMessage(Text.literal("Min Data Points: " + value));
+            this.setMessage(Text.literal("Ignore First: " + value + " min"));
         }
 
         @Override
         protected void applyValue() {
-            config.setMinDataPoints(getValue());
+            config.setIgnoreFirstMinutes(getValue());
         }
 
         private int getValue() {
-            return (int) Math.round(this.value * 17) + 3; // Convert back to 3-20 range
+            return (int) Math.round(this.value * 60); // Convert back to 0-60 range
         }
     }
 
     /**
-     * Custom slider for linear window minutes setting
+     * Custom slider for linear window hours setting (0 = all data)
      */
     private class LinearWindowSlider extends SliderWidget {
 
         public LinearWindowSlider(int x, int y, int width, int height, int initialValue) {
             super(x, y, width, height,
-                    Text.literal("Linear Window: " + initialValue + " min"),
-                    (initialValue - 5) / 235.0); // Normalize to 0-1 range (5 to 240)
+                    initialValue == 0 ? Text.literal("Linear Window: All Data")
+                            : Text.literal("Linear Window: " + initialValue + " hr"),
+                    initialValue / 24.0); // Normalize to 0-1 range (0 to 24)
+        }
+
+        private Text getText(int hours) {
+            if (hours == 0) {
+                return Text.literal("Linear Window: All Data");
+            } else {
+                return Text.literal("Linear Window: " + hours + " hr");
+            }
         }
 
         @Override
         protected void updateMessage() {
             int value = getValue();
-            this.setMessage(Text.literal("Linear Window: " + value + " min"));
+            this.setMessage(getText(value));
         }
 
         @Override
         protected void applyValue() {
-            config.setLinearWindowMinutes(getValue());
+            config.setLinearWindowHours(getValue());
         }
 
         private int getValue() {
-            return (int) Math.round(this.value * 235) + 5; // Convert back to 5-240 range
+            return (int) Math.round(this.value * 24); // Convert back to 0-24 range
         }
     }
 
     /**
-     * Custom slider for rate tracking interval setting
+     * Custom slider for rate tracking interval setting (hours)
      */
     private class RateTrackingSlider extends SliderWidget {
 
-        public RateTrackingSlider(int x, int y, int width, int height, int initialValue) {
+        public RateTrackingSlider(int x, int y, int width, int height, double initialValue) {
             super(x, y, width, height,
-                    Text.literal("Rate Log Interval: " + initialValue + " min"),
-                    (initialValue - 1) / 29.0); // Normalize to 0-1 range (1 to 30)
+                    Text.literal(String.format("Rate Log Interval: %.1f hr", initialValue)),
+                    (initialValue - 0.5) / 5.5); // Normalize to 0-1 range (0.5 to 6.0)
         }
 
         @Override
         protected void updateMessage() {
-            int value = getValue();
-            this.setMessage(Text.literal("Rate Log Interval: " + value + " min"));
+            double value = getValue();
+            this.setMessage(Text.literal(String.format("Rate Log Interval: %.1f hr", value)));
         }
 
         @Override
         protected void applyValue() {
-            config.setRateTrackingIntervalMinutes(getValue());
+            config.setRateTrackingIntervalHours(getValue());
         }
 
-        private int getValue() {
-            return (int) Math.round(this.value * 29) + 1; // Convert back to 1-30 range
+        private double getValue() {
+            return Math.round((this.value * 5.5 + 0.5) * 10) / 10.0; // Convert back to 0.5-6.0 range with 0.1 precision
         }
     }
 }

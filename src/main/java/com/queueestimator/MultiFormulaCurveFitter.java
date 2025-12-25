@@ -22,8 +22,8 @@ public class MultiFormulaCurveFitter {
     private final List<QueueDataTracker.DataPoint> dataPoints;
     private final QueueEstimatorConfig config;
 
-    // Time scale factor - convert ms to minutes for numerical stability
-    private static final double TIME_SCALE = 60000.0;
+    // Time scale factor - convert ms to hours for numerical stability
+    private static final double TIME_SCALE = 3600000.0;
 
     // Maximum ETA: 1 week in milliseconds (anything above is considered invalid)
     private static final long MAX_ETA_MS = 7L * 24 * 60 * 60 * 1000;
@@ -122,37 +122,73 @@ public class MultiFormulaCurveFitter {
             return new MultiResult(results);
         }
 
-        // Prepare data for ALL formulas
-        final int n = dataPoints.size();
+        // Filter out first X minutes of data (warmup period)
+        int ignoreFirstMinutes = config.getIgnoreFirstMinutes();
+        long ignoreMs = ignoreFirstMinutes * 60 * 1000L;
+        long firstTimestamp = dataPoints.get(0).timestamp;
+        long ignoreUntil = firstTimestamp + ignoreMs;
+
+        // Find first index after the warmup period
+        int warmupEndIdx = 0;
+        for (int i = 0; i < dataPoints.size(); i++) {
+            if (dataPoints.get(i).timestamp >= ignoreUntil) {
+                warmupEndIdx = i;
+                break;
+            }
+            warmupEndIdx = i + 1; // If loop completes, all points are in warmup
+        }
+
+        // Create filtered data list (excluding warmup period)
+        List<QueueDataTracker.DataPoint> filteredPoints = dataPoints.subList(warmupEndIdx, dataPoints.size());
+
+        if (filteredPoints.size() < 3) {
+            QueueEstimatorMod.LOGGER.warn("Not enough data points after ignoring first {} min: {} points",
+                    ignoreFirstMinutes, filteredPoints.size());
+            return new MultiResult(results);
+        }
+
+        if (warmupEndIdx > 0) {
+            QueueEstimatorMod.LOGGER.debug("Ignored first {} min of data ({} points), using {} points",
+                    ignoreFirstMinutes, warmupEndIdx, filteredPoints.size());
+        }
+
+        // Prepare data for ALL formulas (from filtered points)
+        final int n = filteredPoints.size();
         final double[] times = new double[n];
         final double[] positions = new double[n];
 
-        long t0 = dataPoints.get(0).timestamp;
+        long t0 = filteredPoints.get(0).timestamp;
         double meanPosition = 0;
         for (int i = 0; i < n; i++) {
-            times[i] = (dataPoints.get(i).timestamp - t0) / TIME_SCALE;
-            positions[i] = dataPoints.get(i).position;
+            times[i] = (filteredPoints.get(i).timestamp - t0) / TIME_SCALE;
+            positions[i] = filteredPoints.get(i).position;
             meanPosition += positions[i];
         }
         meanPosition /= n;
 
         final double finalMeanPosition = meanPosition;
         long currentTimeMs = System.currentTimeMillis();
-        long sessionStartTime = currentTimeMs - dataPoints.get(n - 1).timestamp;
+        long sessionStartTime = currentTimeMs - filteredPoints.get(n - 1).timestamp;
 
         // Prepare WINDOWED data for linear fit
-        int linearWindowMinutes = config.getLinearWindowMinutes();
-        long windowMs = linearWindowMinutes * 60 * 1000L;
-        long cutoffTime = dataPoints.get(n - 1).timestamp - windowMs;
+        int linearWindowHours = config.getLinearWindowHours();
 
-        // Find first index within the window
+        // Determine window bounds for linear fit
         int windowStartIdx = 0;
-        for (int i = 0; i < n; i++) {
-            if (dataPoints.get(i).timestamp >= cutoffTime) {
-                windowStartIdx = i;
-                break;
+        if (linearWindowHours > 0) {
+            // Use last X hours of data
+            long windowMs = linearWindowHours * 60 * 60 * 1000L;
+            long cutoffTime = filteredPoints.get(n - 1).timestamp - windowMs;
+
+            // Find first index within the window
+            for (int i = 0; i < n; i++) {
+                if (filteredPoints.get(i).timestamp >= cutoffTime) {
+                    windowStartIdx = i;
+                    break;
+                }
             }
         }
+        // If linearWindowHours == 0, windowStartIdx stays 0 (use all data)
 
         // Create windowed arrays for linear fit
         int windowN = n - windowStartIdx;
@@ -161,15 +197,15 @@ public class MultiFormulaCurveFitter {
         double windowedMeanPosition = 0;
 
         for (int i = 0; i < windowN; i++) {
-            windowedTimes[i] = (dataPoints.get(windowStartIdx + i).timestamp - t0) / TIME_SCALE;
-            windowedPositions[i] = dataPoints.get(windowStartIdx + i).position;
+            windowedTimes[i] = (filteredPoints.get(windowStartIdx + i).timestamp - t0) / TIME_SCALE;
+            windowedPositions[i] = filteredPoints.get(windowStartIdx + i).position;
             windowedMeanPosition += windowedPositions[i];
         }
         windowedMeanPosition /= windowN;
 
-        if (windowN < n) {
-            QueueEstimatorMod.LOGGER.info("Linear fit using windowed data: {} of {} points (last {} min)",
-                    windowN, n, linearWindowMinutes);
+        if (windowN < n && linearWindowHours > 0) {
+            QueueEstimatorMod.LOGGER.info("Linear fit using windowed data: {} of {} points (last {} hr)",
+                    windowN, n, linearWindowHours);
         }
 
         // Fit LINEAR FIRST to get baseline ETA for validation
@@ -247,35 +283,34 @@ public class MultiFormulaCurveFitter {
 
     /**
      * Linear fit: P(t) = A - B*t
-     * Simple and robust, good baseline
+     * Simple line from first to last data point - most intuitive baseline
      */
     private FitResult fitLinear(double[] times, double[] positions, double meanPos, long sessionStart) {
         try {
             int n = positions.length;
-
-            // Analytical solution using least squares
-            double sumT = 0, sumP = 0, sumT2 = 0, sumTP = 0;
-            for (int i = 0; i < n; i++) {
-                sumT += times[i];
-                sumP += positions[i];
-                sumT2 += times[i] * times[i];
-                sumTP += times[i] * positions[i];
-            }
-
-            double denom = n * sumT2 - sumT * sumT;
-            if (Math.abs(denom) < 1e-10) {
+            if (n < 2) {
                 return new FitResult(FormulaType.LINEAR, new double[] { 0, 0 }, 0, -1, false);
             }
 
-            double B = (n * sumTP - sumT * sumP) / denom;
-            double A = (sumP - B * sumT) / n;
+            // Simple two-point linear: line from first to last point
+            double t0 = times[0];
+            double t1 = times[n - 1];
+            double p0 = positions[0];
+            double p1 = positions[n - 1];
 
-            // We want decreasing position, so B should be negative in our formula P = A -
-            // B*t
-            // Actually we defined it as A - B*t, so B should be positive for decreasing
-            B = -B; // Convert from slope to rate
+            double deltaT = t1 - t0;
+            if (Math.abs(deltaT) < 1e-10) {
+                return new FitResult(FormulaType.LINEAR, new double[] { 0, 0 }, 0, -1, false);
+            }
 
-            // Calculate R² (coefficient of determination)
+            // slope = (p1 - p0) / (t1 - t0), should be negative for decreasing queue
+            double slope = (p1 - p0) / deltaT;
+            // P(t) = p0 + slope * (t - t0) = (p0 - slope*t0) + slope*t
+            // In form P = A - B*t: A = p0 - slope*t0, B = -slope
+            double A = p0 - slope * t0;
+            double B = -slope; // B > 0 means queue is decreasing
+
+            // Calculate R² against all data points
             double sse = 0; // Sum of squared errors
             double sst = 0; // Total sum of squares
             for (int i = 0; i < n; i++) {
@@ -290,13 +325,13 @@ public class MultiFormulaCurveFitter {
             // Calculate ETA: when does A - B*t = 0? t = A/B
             long etaMs = -1;
             if (B > 0 && A > 0) {
-                double tZeroMinutes = A / B;
-                etaMs = (long) (tZeroMinutes * TIME_SCALE) - dataPoints.get(dataPoints.size() - 1).timestamp;
+                double tZeroHours = A / B;
+                etaMs = (long) (tZeroHours * TIME_SCALE) - dataPoints.get(dataPoints.size() - 1).timestamp;
                 if (etaMs < 0)
                     etaMs = -1;
             }
 
-            QueueEstimatorMod.LOGGER.info("Linear fit: A={}, B={}, R²={}, etaMs={}",
+            QueueEstimatorMod.LOGGER.info("Linear fit (first-last): A={}, B={}, R²={}, etaMs={}",
                     formatNumber(A), formatNumber(B), String.format("%.4f", rSquared), etaMs);
 
             return new FitResult(FormulaType.LINEAR, new double[] { A, B }, rSquared, validateEta(etaMs, "Linear"),

@@ -30,13 +30,14 @@ public class QueueEstimatorConfig {
 
     // Display settings
     private boolean showAllResults = true; // Show all successful fits or just the best one
-    private int minDataPoints = 5; // Minimum data points before attempting fit
+    private int ignoreFirstMinutes = 10; // Ignore first X minutes of data (warmup period)
 
-    // Linear fit windowing - only use last X minutes of data for linear fit
-    private int linearWindowMinutes = 60; // Default: 60 minutes
+    // Linear fit windowing - 0 = use all data, otherwise only use last X hours of
+    // data
+    private int linearWindowHours = 0; // Default: 0 = use all data
 
-    // Rate tracking interval - print average rate every X minutes
-    private int rateTrackingIntervalMinutes = 5; // Default: 5 minutes
+    // Rate tracking interval - print average rate every X hours
+    private double rateTrackingIntervalHours = 1.0; // Default: 1 hour
 
     private QueueEstimatorConfig() {
     }
@@ -143,28 +144,28 @@ public class QueueEstimatorConfig {
         this.showAllResults = showAll;
     }
 
-    public int getMinDataPoints() {
-        return minDataPoints;
+    public int getIgnoreFirstMinutes() {
+        return ignoreFirstMinutes;
     }
 
-    public void setMinDataPoints(int minPoints) {
-        this.minDataPoints = Math.max(3, Math.min(20, minPoints));
+    public void setIgnoreFirstMinutes(int minutes) {
+        this.ignoreFirstMinutes = Math.max(0, Math.min(60, minutes)); // 0 to 60 minutes
     }
 
-    public int getLinearWindowMinutes() {
-        return linearWindowMinutes;
+    public int getLinearWindowHours() {
+        return linearWindowHours;
     }
 
-    public void setLinearWindowMinutes(int minutes) {
-        this.linearWindowMinutes = Math.max(5, Math.min(240, minutes)); // 5 min to 4 hours
+    public void setLinearWindowHours(int hours) {
+        this.linearWindowHours = Math.max(0, Math.min(24, hours)); // 0 = all data, or 1-24 hours
     }
 
-    public int getRateTrackingIntervalMinutes() {
-        return rateTrackingIntervalMinutes;
+    public double getRateTrackingIntervalHours() {
+        return rateTrackingIntervalHours;
     }
 
-    public void setRateTrackingIntervalMinutes(int minutes) {
-        this.rateTrackingIntervalMinutes = Math.max(1, Math.min(30, minutes)); // 1 to 30 minutes
+    public void setRateTrackingIntervalHours(double hours) {
+        this.rateTrackingIntervalHours = Math.max(0.5, Math.min(6.0, hours)); // 0.5 to 6 hours
     }
 
     /**
